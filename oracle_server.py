@@ -14,13 +14,23 @@ ADMIN_KEY = os.environ.get("ORACLE_ADMIN_KEY", "sychos-admin-2024")
 DB_PATH = os.environ.get("ORACLE_DB", "sychos.db")
 
 GEMINI_KEYS = {
-    "gemini-2.0-flash": "AQ.Ab8RN6LDdNjg0xJggKE2UM7TCJTIuxEPuZFqrPG7-g1JecRcFA",
-    "gemini-2.5-flash": "AQ.Ab8RN6LDdNjg0xJggKE2UM7TCJTIuxEPuZFqrPG7-g1JecRcFA",
+    "gemini-pro": "AQ.Ab8RN6Kb5jrnYfwoqO1_Bqs5oNarbQnKYkF3r-3nvuBwaQo2bA",
+}
+
+GROQ_KEYS = {
+    "groq-llama": "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",
 }
 
 MODELS = {
-    "gemini-2.0-flash": {"name": "Gemini 2.0 Flash", "base_cost": 2},
-    "gemini-2.5-flash": {"name": "Gemini 2.5 Pro", "base_cost": 3},
+    "gemini-pro": {"name": "Gemini Pro", "base_cost": 2, "provider": "gemini"},
+    "groq-llama": {"name": "Groq Llama 3.3 70B (Free)", "base_cost": 1, "provider": "groq"},
+}
+
+STRENGTHS = {
+    "low": {"name": "Low", "max_tokens": 512, "temp": 0.3},
+    "medium": {"name": "Medium", "max_tokens": 2048, "temp": 0.7},
+    "high": {"name": "High", "max_tokens": 4096, "temp": 1.0},
+    "extra": {"name": "Extra", "max_tokens": 8192, "temp": 1.3},
 }
 
 # Dynamische Auslastungs-Tracker
@@ -107,19 +117,32 @@ def hash_pw(pw):
 # ═══════════════════════════════════════════════════════════
 #  GEMINI AI PROXY
 # ═══════════════════════════════════════════════════════════
-def call_gemini(model, messages, api_key):
-    """Sendet Chat an Gemini API und gibt die Antwort zurück."""
+def call_gemini(model, messages, api_key, strength="medium", language=""):
+    """Sendet Chat an Gemini API mit Stärke und Spracheinstellung."""
     if not api_key:
         return {"ok": False, "error": f"Kein API Key für {model} konfiguriert"}
 
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+    s = STRENGTHS.get(strength, STRENGTHS["medium"])
 
     contents = []
     for m in messages:
         role = "user" if m["role"] == "user" else "model"
         contents.append({"role": role, "parts": [{"text": m["content"]}]})
 
-    payload = json.dumps({"contents": contents}).encode()
+    # Sprach-Hinweis hinzufügen
+    if language:
+        lang_note = f"\n\n[Antworte auf {language}]"
+        if contents:
+            contents[-1]["parts"][0]["text"] += lang_note
+
+    payload = json.dumps({
+        "contents": contents,
+        "generationConfig": {
+            "maxOutputTokens": s["max_tokens"],
+            "temperature": s["temp"],
+        }
+    }).encode()
     req = urllib.request.Request(url, data=payload,
         headers={"Content-Type": "application/json"}, method="POST")
 
@@ -131,6 +154,36 @@ def call_gemini(model, messages, api_key):
             return {"ok": True, "text": text, "tokens": tokens}
     except Exception as e:
         return {"ok": False, "error": str(e)}
+
+def call_groq(messages, api_key):
+    """Sendet Chat an Groq API."""
+    if not api_key:
+        return {"ok": False, "error": "Kein Groq API Key"}
+    url = "https://api.groq.com/openai/v1/chat/completions"
+    payload = json.dumps({
+        "model": "llama-3.3-70b-versatile",
+        "messages": messages,
+        "max_tokens": 4096,
+    }).encode()
+    req = urllib.request.Request(url, data=payload, headers={
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {api_key}"
+    }, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = json.loads(resp.read())
+            text = data["choices"][0]["message"]["content"]
+            tokens = data.get("usage", {}).get("total_tokens", 0)
+            return {"ok": True, "text": text, "tokens": tokens}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+def proxy_openai(provider, messages):
+    """OpenAI-kompatibler Proxy für Open WebUI."""
+    if provider == "groq":
+        return call_groq(messages, GROQ_KEYS.get("groq-llama", ""))
+    else:
+        return call_gemini("gemini-pro", messages, GEMINI_KEYS.get("gemini-pro", ""))
 
 # ═══════════════════════════════════════════════════════════
 #  HTTP HANDLER
@@ -192,6 +245,17 @@ class Handler(BaseHTTPRequestHandler):
                  "current_cost": get_dynamic_cost(v["base_cost"])}
                 for k, v in MODELS.items()
             ]})
+            return
+
+        # OpenAI-kompatibler /v1/models Endpoint
+        if path == "/v1/models":
+            self._json(200, {
+                "object": "list",
+                "data": [
+                    {"id": "gemini-pro", "object": "model", "owned_by": "sychos", "name": "Gemini Pro"},
+                    {"id": "groq-llama", "object": "model", "owned_by": "sychos", "name": "Groq Llama 3.3 70B (Free)"},
+                ]
+            })
             return
 
         if path == "/me":
@@ -319,6 +383,45 @@ class Handler(BaseHTTPRequestHandler):
             self._json(200, {"ok": True})
             return
 
+        # OpenAI-kompatibler /v1/chat/completions Endpoint
+        if path == "/v1/chat/completions":
+            auth = self.headers.get("Authorization", "")
+            if not auth.startswith("Bearer "):
+                self._json(401, {"error": {"message": "No API key", "type": "auth_error"}}); return
+            uid = auth[7:]
+            user = None
+            db = get_db()
+            row = db.execute("SELECT * FROM users WHERE uid=?", (uid,)).fetchone()
+            db.close()
+            if not row:
+                self._json(401, {"error": {"message": "User nicht gefunden", "type": "auth_error"}}); return
+            user = dict(row)
+            if user["is_banned"]:
+                self._json(403, {"error": {"message": "Account gesperrt", "type": "auth_error"}}); return
+            if user["credits"] < 2:
+                self._json(402, {"error": {"message": "Keine Credits", "type": "credit_error"}}); return
+            messages = body.get("messages", [])
+            model = body.get("model", "gemini-pro")
+            provider = MODELS.get(model, {}).get("provider", "gemini")
+            result = proxy_openai(provider, messages)
+            if not result["ok"]:
+                self._json(500, {"error": {"message": result["error"], "type": "api_error"}}); return
+            base_cost = MODELS.get(model, {}).get("base_cost", 2)
+            cost = get_dynamic_cost(base_cost)
+            db = get_db()
+            db.execute("UPDATE users SET credits = MAX(0, credits - ?) WHERE uid=?", (cost, uid))
+            db.commit(); db.close()
+            remaining = max(0, user["credits"] - cost)
+            self._json(200, {
+                "id": f"chatcmpl-{int(time.time())}",
+                "object": "chat.completion",
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": result["text"]}, "finish_reason": "stop"}],
+                "usage": {"total_tokens": result.get("tokens", 0)},
+                "credits_remaining": remaining,
+                "credits_cost": cost,
+            })
+            return
+
         # AI Chat
         if path == "/chat/send":
             user = self._get_user()
@@ -330,20 +433,19 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(402, {"ok": False, "error": "Nicht genug Credits (min. 2)"}); return
             cid = body.get("chat_id", "")
             msg = body.get("message", "").strip()
-            model = body.get("model", "gemini-2.0-flash")
+            model = body.get("model", "gemini")
+            strength = body.get("strength", "medium")
+            language = body.get("language", "")
             if not msg:
                 self._json(400, {"ok": False, "error": "Leere Nachricht"}); return
             api_key = GEMINI_KEYS.get(model, "")
             db = get_db()
-            # Save user message
             db.execute("INSERT INTO messages (chat_id,role,content,model,created_at) VALUES (?,?,?,?,?)",
                        (cid, "user", msg, model, time.time()))
-            # Build history
             rows = db.execute("SELECT role,content FROM messages WHERE chat_id=? ORDER BY created_at", (cid,)).fetchall()
             history = [{"role": r["role"], "content": r["content"]} for r in rows]
             db.commit(); db.close()
-            # Call AI
-            result = call_gemini(model, history, api_key)
+            result = call_gemini(model, history, api_key, strength, language)
             if not result["ok"]:
                 self._json(500, {"ok": False, "error": result["error"]}); return
             # Save AI response & deduct dynamic credits
