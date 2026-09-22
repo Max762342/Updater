@@ -1,12 +1,11 @@
 """
-Sychos Net — Oracle Server v2.0
-Zentraler Server: Users, Credits, AI-Chat, Admin
+Sychos Net — Oracle Server v2.1
+Zentraler Server: Users, Credits (2-4 dynamisch), AI-Chat, Admin
 """
-import os, sys, json, time, hmac, socket, platform
-import sqlite3, hashlib, uuid, threading
-import urllib.request, urllib.error
+import os, sys, json, time, hmac, hashlib, uuid, threading
+import sqlite3, urllib.request
 from http.server import HTTPServer, BaseHTTPRequestHandler
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse
 
 HOST = os.environ.get("ORACLE_HOST", "0.0.0.0")
 PORT = int(os.environ.get("ORACLE_PORT", "7777"))
@@ -15,12 +14,37 @@ ADMIN_KEY = os.environ.get("ORACLE_ADMIN_KEY", "sychos-admin-2024")
 DB_PATH = os.environ.get("ORACLE_DB", "sychos.db")
 
 GEMINI_KEYS = {
-    "gemini-2.0-flash": os.environ.get("GEMINI_KEY_FLASH", ""),
-    "gemini-2.5-flash": os.environ.get("GEMINI_KEY_PRO", ""),
+    "gemini-2.0-flash": "AQ.Ab8RN6LDdNjg0xJggKE2UM7TCJTIuxEPuZFqrPG7-g1JecRcFA",
+    "gemini-2.5-flash": "AQ.Ab8RN6LDdNjg0xJggKE2UM7TCJTIuxEPuZFqrPG7-g1JecRcFA",
 }
 
+MODELS = {
+    "gemini-2.0-flash": {"name": "Gemini 2.0 Flash", "base_cost": 2},
+    "gemini-2.5-flash": {"name": "Gemini 2.5 Pro", "base_cost": 3},
+}
+
+# Dynamische Auslastungs-Tracker
+request_times = []
+LOAD_LOCK = threading.Lock()
+
+def get_dynamic_cost(base_cost=2):
+    """Berechnet dynamische Credits (2-4) je nach Auslastung."""
+    with LOAD_LOCK:
+        now = time.time()
+        # Nur Anfragen der letzten 60 Sekunden zählen
+        recent = [t for t in request_times if now - t < 60]
+        request_times.clear()
+        request_times.extend(recent)
+        load = len(recent)
+        request_times.append(now)
+    if load < 5:
+        return base_cost
+    elif load < 15:
+        return base_cost + 1
+    else:
+        return min(base_cost + 2, 4)
+
 START_TIME = time.time()
-db_lock = threading.Lock()
 
 # ═══════════════════════════════════════════════════════════
 #  DATABASE
@@ -39,11 +63,13 @@ def init_db():
             email TEXT UNIQUE NOT NULL,
             password_hash TEXT NOT NULL,
             display_name TEXT DEFAULT '',
-            credits REAL DEFAULT 100.0,
+            credits REAL DEFAULT 50.0,
             is_banned INTEGER DEFAULT 0,
             is_admin INTEGER DEFAULT 0,
             created_at REAL DEFAULT 0,
-            last_login REAL DEFAULT 0
+            last_login REAL DEFAULT 0,
+            referral_code TEXT UNIQUE,
+            referred_by TEXT DEFAULT ''
         );
         CREATE TABLE IF NOT EXISTS chats (
             id TEXT PRIMARY KEY,
@@ -156,8 +182,16 @@ class Handler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
 
         if path == "/status":
-            self._json(200, {"ok": True, "server": "Sychos Oracle", "version": "2.0.0",
-                "uptime": int(time.time() - START_TIME), "hostname": socket.gethostname()})
+            self._json(200, {"ok": True, "server": "Sychos Oracle", "version": "2.1.0",
+                "uptime": int(time.time() - START_TIME), "load": len(request_times)})
+            return
+
+        if path == "/models":
+            self._json(200, {"ok": True, "models": [
+                {"id": k, "name": v["name"], "base_cost": v["base_cost"],
+                 "current_cost": get_dynamic_cost(v["base_cost"])}
+                for k, v in MODELS.items()
+            ]})
             return
 
         if path == "/me":
@@ -168,7 +202,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(403, {"ok": False, "error": "Account gesperrt"}); return
             self._json(200, {"ok": True, "uid": user["uid"], "email": user["email"],
                 "display_name": user["display_name"], "credits": user["credits"],
-                "is_admin": user["is_admin"]})
+                "is_admin": user["is_admin"], "referral_code": user.get("referral_code", "")})
             return
 
         if path == "/chats":
@@ -213,6 +247,7 @@ class Handler(BaseHTTPRequestHandler):
             email = body.get("email", "").strip().lower()
             pw = body.get("password", "")
             name = body.get("display_name", email.split("@")[0])
+            ref_code = body.get("referral_code", "").strip()
             if not email or not pw:
                 self._json(400, {"ok": False, "error": "Email und Passwort benötigt"}); return
             db = get_db()
@@ -220,10 +255,19 @@ class Handler(BaseHTTPRequestHandler):
                 db.close()
                 self._json(409, {"ok": False, "error": "Email bereits registriert"}); return
             uid = str(uuid.uuid4())
-            db.execute("INSERT INTO users (uid,email,password_hash,display_name,credits,created_at) VALUES (?,?,?,?,?,?)",
-                       (uid, email, hash_pw(pw), name, 100.0, time.time()))
+            my_ref = uuid.uuid4().hex[:8].upper()
+            referred_by = ""
+            start_credits = 50.0
+            # Referral Bonus
+            if ref_code:
+                ref_user = db.execute("SELECT uid, credits FROM users WHERE referral_code=?", (ref_code,)).fetchone()
+                if ref_user:
+                    referred_by = ref_user["uid"]
+                    db.execute("UPDATE users SET credits = credits + 25 WHERE uid=?", (ref_user["uid"],))
+            db.execute("INSERT INTO users (uid,email,password_hash,display_name,credits,created_at,referral_code,referred_by) VALUES (?,?,?,?,?,?,?,?)",
+                       (uid, email, hash_pw(pw), name, start_credits, time.time(), my_ref, referred_by))
             db.commit(); db.close()
-            self._json(200, {"ok": True, "uid": uid, "display_name": name, "credits": 100.0})
+            self._json(200, {"ok": True, "uid": uid, "display_name": name, "credits": start_credits, "referral_code": my_ref})
             return
 
         # Login
@@ -282,8 +326,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(401, {"ok": False, "error": "Nicht angemeldet"}); return
             if user["is_banned"]:
                 self._json(403, {"ok": False, "error": "Account gesperrt"}); return
-            if user["credits"] < 1:
-                self._json(402, {"ok": False, "error": "Keine Credits mehr"}); return
+            if user["credits"] < 2:
+                self._json(402, {"ok": False, "error": "Nicht genug Credits (min. 2)"}); return
             cid = body.get("chat_id", "")
             msg = body.get("message", "").strip()
             model = body.get("model", "gemini-2.0-flash")
@@ -302,8 +346,9 @@ class Handler(BaseHTTPRequestHandler):
             result = call_gemini(model, history, api_key)
             if not result["ok"]:
                 self._json(500, {"ok": False, "error": result["error"]}); return
-            # Save AI response & deduct credits
-            cost = max(1, result.get("tokens", 100) / 100)
+            # Save AI response & deduct dynamic credits
+            base = MODELS.get(model, {}).get("base_cost", 2)
+            cost = get_dynamic_cost(base)
             db = get_db()
             db.execute("INSERT INTO messages (chat_id,role,content,model,tokens,cost,created_at) VALUES (?,?,?,?,?,?,?)",
                        (cid, "assistant", result["text"], model, result.get("tokens", 0), cost, time.time()))
