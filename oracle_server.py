@@ -9,7 +9,7 @@ from urllib.parse import urlparse
 
 HOST = os.environ.get("ORACLE_HOST", "0.0.0.0")
 PORT = int(os.environ.get("ORACLE_PORT", "7777"))
-API_KEY = os.environ.get("ORACLE_APIA_KEY", "sychos-oracle-2024")
+API_KEY = os.environ.get("ORACLE_API_KEY", "sychos-oracle-2024")
 ADMIN_KEY = os.environ.get("ORACLE_ADMIN_KEY", "sychos-admin-2024")
 DB_PATH = os.environ.get("ORACLE_DB", "sychos.db")
 
